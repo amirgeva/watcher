@@ -620,7 +620,7 @@ class ImageReceiver(QtCore.QThread):
 	# ------------------------------------------------------------------
 
 	def _handle(self, conn):
-		conn.settimeout(5.0)
+		conn.settimeout(None)
 		hdr_size = self._HEADER.size
 		while self._running:
 			try:
