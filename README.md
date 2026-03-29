@@ -96,7 +96,8 @@ Right-click any pixel while zoomed in (> 4×) and at least one pixel away from t
 
 The **History** dock (right side) shows a thumbnail list of every image you have viewed or saved.
 
-- Images received over the network are displayed immediately but **not** saved to history automatically — use the **Save to History** toolbar button to snapshot a frame you want to keep
+- **Unnamed** images received over the network are displayed immediately but **not** saved to history automatically — use the **Save to History** toolbar button to snapshot a frame you want to keep
+- **Named** images (sent with a non-empty `name` field) are added to history automatically; resending the same name overwrites the previous entry
 - Images opened from a file or pasted from the clipboard are added to history automatically
 - History is persisted to `~/.watcher/` as PNG files and reloaded on the next launch
 - Right-click any thumbnail and choose **Remove** to delete it from history and disk
@@ -141,40 +142,63 @@ Detected keypoints are displayed as red circle markers on the image. Use the **C
 
 ## Network protocol
 
-Watcher listens on `0.0.0.0:14972` (TCP) as soon as it starts. Any process on the same machine can push raw image frames to it.
+Watcher listens on `0.0.0.0:14972` (TCP) as soon as it starts. Any process on the same machine can push raw image frames to it or send commands.
 
 ### Wire format
 
-Each image consists of a fixed 16-byte header followed immediately by raw pixel data:
+Each message consists of a fixed 36-byte header followed (for image messages) by raw pixel data. All integer fields are little-endian:
 
 ```
-Offset  Size  Type    Description
-──────  ────  ──────  ──────────────────────────────────────────
-     0     4  bytes   Magic: 'W', 'I', 'M', 'G'
-     4     4  uint32  Width in pixels  (little-endian)
-     8     4  uint32  Height in pixels (little-endian)
-    12     4  uint32  Channels: 1 = grayscale, 3 = BGR, 4 = BGRA
+Offset  Size  Type      Description
+──────  ────  ────────  ──────────────────────────────────────────
+     0     4  bytes     Magic: 'W', 'I', 'M', 'G'
+     4     4  uint32    Type: 0 = image, 1 = clear history
+     8     4  uint32    Width in pixels
+    12     4  uint32    Height in pixels
+    16     4  uint32    Channels: 1 = grayscale, 3 = BGR, 4 = BGRA
+    20    16  char[16]  Name (null-padded UTF-8)
 ```
 
-**Payload:** `width × height × channels` bytes of raw `uint8` pixel data, row-major, top-left first, in BGR(A) byte order (matching OpenCV's default).
+#### Message types
 
-Multiple frames may be sent over a single connection sequentially. The server reads them until the connection is closed.
+| Type | Behaviour |
+|------|-----------|
+| **0 — image** | Header is followed by `width × height × channels` bytes of raw `uint8` pixel data, row-major, top-left first, BGR(A) byte order (matching OpenCV's default). |
+| **1 — clear** | Clears all history entries. No pixel payload follows; width/height/channels are ignored. |
+
+#### Named images
+
+The 16-byte `name` field optionally identifies an image:
+
+- **Unnamed** (`name[0] == 0`): the image is displayed immediately but not added to history automatically (use the **Save to History** toolbar button to keep it).
+- **Named** (non-empty string): the image is displayed and added to history using the name as its label. If an image with the same name already exists in history, it is **replaced** in-place — useful for live-updating a fixed set of named channels without flooding the history list.
+
+Multiple messages may be sent over a single connection sequentially. The server reads them until the connection is closed.
 
 ### Sending from Python
 
 ```python
 import socket, struct, numpy as np
 
-def send_image(arr: np.ndarray, host="127.0.0.1", port=14972):
-    """arr must be uint8, shape (H, W) or (H, W, 3) or (H, W, 4), BGR(A) byte order."""
+def send_image(arr: np.ndarray, name: str = "", host="127.0.0.1", port=14972):
+    """arr must be uint8, shape (H, W) or (H, W, 3) or (H, W, 4), BGR(A) byte order.
+    name is an optional label (max 15 UTF-8 bytes). Named images replace
+    previous history entries with the same name."""
     if arr.ndim == 2:
         h, w, ch = arr.shape[0], arr.shape[1], 1
         arr = arr.reshape(h, w, 1)
     else:
         h, w, ch = arr.shape
-    header = struct.pack("<4sIII", b"WIMG", w, h, ch)
+    name_bytes = name.encode("utf-8")[:15].ljust(16, b"\x00")
+    header = struct.pack("<4sIIII16s", b"WIMG", 0, w, h, ch, name_bytes)
     with socket.create_connection((host, port)) as s:
         s.sendall(header + np.ascontiguousarray(arr).tobytes())
+
+def clear_history(host="127.0.0.1", port=14972):
+    """Send a clear-history command."""
+    header = struct.pack("<4sIIII16s", b"WIMG", 1, 0, 0, 0, b"\x00" * 16)
+    with socket.create_connection((host, port)) as s:
+        s.sendall(header)
 ```
 
 ### Sending from C++ (img_send_test)
