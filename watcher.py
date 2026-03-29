@@ -545,30 +545,39 @@ class ImageReceiver(QtCore.QThread):
 
 	Protocol
 	--------
-	Each image is prefixed by a 16-byte header (all fields little-endian):
+	Each message is prefixed by a 36-byte header (all fields little-endian):
 
 	    Offset  Size  Type    Description
 	    ──────  ────  ──────  ────────────────────────────────────────
 	         0     4  bytes   Magic: b'WIMG'
-	         4     4  uint32  Width  (pixels)
-	         8     4  uint32  Height (pixels)
-	        12     4  uint32  Channels: 1 = grayscale, 3 = BGR, 4 = BGRA
+	         4     4  uint32  Type: 0 = image, 1 = clear history
+	         8     4  uint32  Width  (pixels)
+	        12     4  uint32  Height (pixels)
+	        16     4  uint32  Channels: 1 = grayscale, 3 = BGR, 4 = BGRA
+	        20    16  char[]  Name (null-padded, UTF-8). If name[0]==0
+	                          the image is unnamed.
 
-	Immediately after the header come width × height × channels bytes of
-	raw uint8 pixel data in row-major order (top-left first):
+	For type 0 (image), the header is followed by width × height × channels
+	bytes of raw uint8 pixel data in row-major order (top-left first):
 	  • 1 ch : grayscale
 	  • 3 ch : packed B G R per pixel
 	  • 4 ch : packed B G R A per pixel
 
-	A client may send multiple images over a single connection; the server
+	If name is non-empty, the image replaces any existing history entry
+	with the same name. For type 1, no pixel data follows.
+
+	A client may send multiple messages over a single connection; the server
 	reads them sequentially until the connection is closed.
 	"""
 
-	image_received = QtCore.pyqtSignal(QtGui.QPixmap)
+	image_received = QtCore.pyqtSignal(QtGui.QPixmap, str)  # pixmap, name
+	clear_requested = QtCore.pyqtSignal()
 
 	_MAGIC          = b'WIMG'
-	_HEADER         = struct.Struct('<4sIII')   # magic, width, height, channels
+	_HEADER         = struct.Struct('<4s I III 16s')   # magic, type, w, h, ch, name
 	_VALID_CHANNELS = {1, 3, 4}
+	_TYPE_IMAGE     = 0
+	_TYPE_CLEAR     = 1
 
 	def __init__(self, host='0.0.0.0', port=14972, parent=None):
 		super().__init__(parent)
@@ -616,13 +625,25 @@ class ImageReceiver(QtCore.QThread):
 		while self._running:
 			try:
 				hdr_bytes = self._recv_exact(conn, hdr_size)
-				magic, width, height, channels = self._HEADER.unpack(hdr_bytes)
+				magic, msg_type, width, height, channels, name_raw = self._HEADER.unpack(hdr_bytes)
 			except OSError:
 				break
 
-			if (magic != self._MAGIC or channels not in self._VALID_CHANNELS
+			if magic != self._MAGIC:
+				break
+
+			name = name_raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+
+			if msg_type == self._TYPE_CLEAR:
+				self.clear_requested.emit()
+				continue
+
+			if msg_type != self._TYPE_IMAGE:
+				break
+
+			if (channels not in self._VALID_CHANNELS
 					or width == 0 or height == 0):
-				break   # protocol error — drop connection
+				break
 
 			try:
 				data = self._recv_exact(conn, width * height * channels)
@@ -631,7 +652,7 @@ class ImageReceiver(QtCore.QThread):
 
 			pixmap = self._to_pixmap(data, width, height, channels)
 			if pixmap is not None:
-				self.image_received.emit(pixmap)
+				self.image_received.emit(pixmap, name)
 
 	@staticmethod
 	def _recv_exact(sock, n):
@@ -685,9 +706,8 @@ class MainWindow(QtWidgets.QMainWindow):
 		self._load_persistent_history()
 		self._restore_window_state()
 		self._receiver = ImageReceiver()
-		self._receiver.image_received.connect(
-			lambda px: self.display_image(px, "Network frame")
-		)
+		self._receiver.image_received.connect(self._on_network_image)
+		self._receiver.clear_requested.connect(self._clear_history)
 		self._receiver.start()
 
 	def _restore_window_state(self):
@@ -1092,11 +1112,41 @@ class MainWindow(QtWidgets.QMainWindow):
 			return path
 		return None
 
-	def _add_image_to_history(self, pixmap, label, file_path=None, persist=True):
+	def _add_image_to_history(self, pixmap, label, file_path=None, persist=True, named_key=None):
 		if pixmap is None or pixmap.isNull():
 			return
 
 		stored = pixmap.copy()
+
+		# Overwrite existing entry with the same named_key.
+		if named_key:
+			for i, entry in enumerate(self._history_items):
+				if entry.get("named_key") == named_key:
+					old_path = entry.get("path")
+					if old_path and os.path.isfile(old_path):
+						try:
+							os.remove(old_path)
+						except OSError:
+							pass
+					new_path = self._save_pixmap_to_history(stored) if persist else file_path
+					entry["pixmap"] = stored
+					entry["path"] = new_path
+					# Update the list widget item.
+					for j in range(self._history_list.count()):
+						it = self._history_list.item(j)
+						if it.data(QtCore.Qt.ItemDataRole.UserRole) == i:
+							thumb = stored.scaled(
+								96, 96,
+								QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+								QtCore.Qt.TransformationMode.SmoothTransformation,
+							)
+							it.setIcon(QtGui.QIcon(thumb))
+							self._history_list.setCurrentItem(it)
+							break
+					self._current_image_in_history = True
+					self._save_to_history_action.setEnabled(False)
+					return
+
 		if persist:
 			file_path = self._save_pixmap_to_history(stored)
 
@@ -1104,6 +1154,8 @@ class MainWindow(QtWidgets.QMainWindow):
 			"pixmap": stored,
 			"path": file_path,
 		}
+		if named_key:
+			entry["named_key"] = named_key
 		self._history_items.append(entry)
 		index = len(self._history_items) - 1
 
@@ -1170,6 +1222,13 @@ class MainWindow(QtWidgets.QMainWindow):
 		if self._image_widget.image_pixmap() is not None:
 			self._current_image_in_history = False
 			self._save_to_history_action.setEnabled(True)
+
+	def _on_network_image(self, pixmap, name):
+		if name:
+			self._image_widget.set_image(pixmap)
+			self._add_image_to_history(pixmap, name, named_key=name)
+		else:
+			self.display_image(pixmap, "Network frame")
 
 	def display_image(self, image, label=""):
 		"""Display an image without adding it to history.
