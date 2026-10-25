@@ -1,8 +1,10 @@
 import sys
 import os
+import queue
 import shutil
 import socket
 import struct
+import threading
 import uuid
 from PyQt6 import QtWidgets, QtCore, QtGui
 
@@ -568,6 +570,13 @@ class ImageReceiver(QtCore.QThread):
 
 	A client may send multiple messages over a single connection; the server
 	reads them sequentially until the connection is closed.
+
+	Threading
+	---------
+	An accept thread spawns one reader thread per connection, so several
+	clients can stream concurrently. Readers push parsed messages into a
+	single bounded queue (a full queue applies back-pressure to senders);
+	this QThread is the only consumer and emits the Qt signals in order.
 	"""
 
 	image_received = QtCore.pyqtSignal(QtGui.QPixmap, str)  # pixmap, name
@@ -578,12 +587,17 @@ class ImageReceiver(QtCore.QThread):
 	_VALID_CHANNELS = {1, 3, 4}
 	_TYPE_IMAGE     = 0
 	_TYPE_CLEAR     = 1
+	_QUEUE_SIZE     = 64    # pending messages across all connections
+	_POLL_INTERVAL  = 0.2   # seconds between checks of the stop flag
 
 	def __init__(self, host='0.0.0.0', port=14972, parent=None):
 		super().__init__(parent)
 		self._host    = host
 		self._port    = port
 		self._running = False
+		self._queue   = queue.Queue(maxsize=self._QUEUE_SIZE)
+		self._readers = set()
+		self._lock    = threading.Lock()
 
 	def run(self):
 		self._running = True
@@ -591,27 +605,27 @@ class ImageReceiver(QtCore.QThread):
 			srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 			srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 			srv.bind((self._host, self._port))
-			srv.listen(1)
-			srv.settimeout(1.0)
+			srv.listen(8)
+			srv.settimeout(self._POLL_INTERVAL)
 		except OSError as exc:
 			print(f'ImageReceiver: bind failed on {self._host}:{self._port}: {exc}',
 			      file=sys.stderr)
 			return
 
-		try:
-			while self._running:
-				try:
-					conn, _ = srv.accept()
-				except TimeoutError:
-					continue
-				except OSError:
-					break
-				try:
-					self._handle(conn)
-				finally:
-					conn.close()
-		finally:
-			srv.close()
+		acceptor = threading.Thread(target=self._accept_loop, args=(srv,), daemon=True)
+		acceptor.start()
+		while self._running:
+			try:
+				item = self._queue.get(timeout=self._POLL_INTERVAL)
+			except queue.Empty:
+				continue
+			self._dispatch(item)
+		acceptor.join()
+		# Readers poll the stop flag, so they exit within one interval.
+		with self._lock:
+			readers = list(self._readers)
+		for reader in readers:
+			reader.join()
 
 	def stop(self):
 		self._running = False
@@ -619,8 +633,49 @@ class ImageReceiver(QtCore.QThread):
 
 	# ------------------------------------------------------------------
 
+	def _accept_loop(self, srv):
+		with srv:
+			while self._running:
+				try:
+					conn, _ = srv.accept()
+				except TimeoutError:
+					continue
+				except OSError:
+					break
+				reader = threading.Thread(target=self._serve, args=(conn,), daemon=True)
+				with self._lock:
+					self._readers.add(reader)
+				reader.start()
+
+	def _serve(self, conn):
+		try:
+			self._handle(conn)
+		finally:
+			conn.close()
+			with self._lock:
+				self._readers.discard(threading.current_thread())
+
+	def _enqueue(self, item):
+		'''Blocks while the queue is full; returns False if stopping.'''
+		while self._running:
+			try:
+				self._queue.put(item, timeout=self._POLL_INTERVAL)
+				return True
+			except queue.Full:
+				continue
+		return False
+
+	def _dispatch(self, item):
+		if item[0] == self._TYPE_CLEAR:
+			self.clear_requested.emit()
+			return
+		_, data, width, height, channels, name = item
+		pixmap = self._to_pixmap(data, width, height, channels)
+		if pixmap is not None:
+			self.image_received.emit(pixmap, name)
+
 	def _handle(self, conn):
-		conn.settimeout(None)
+		conn.settimeout(self._POLL_INTERVAL)
 		hdr_size = self._HEADER.size
 		while self._running:
 			try:
@@ -635,7 +690,8 @@ class ImageReceiver(QtCore.QThread):
 			name = name_raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
 
 			if msg_type == self._TYPE_CLEAR:
-				self.clear_requested.emit()
+				if not self._enqueue((self._TYPE_CLEAR,)):
+					break
 				continue
 
 			if msg_type != self._TYPE_IMAGE:
@@ -650,17 +706,21 @@ class ImageReceiver(QtCore.QThread):
 			except OSError:
 				break
 
-			pixmap = self._to_pixmap(data, width, height, channels)
-			if pixmap is not None:
-				self.image_received.emit(pixmap, name)
+			if not self._enqueue((self._TYPE_IMAGE, data, width, height, channels, name)):
+				break
 
-	@staticmethod
-	def _recv_exact(sock, n):
+	def _recv_exact(self, sock, n):
 		buf      = bytearray(n)
 		view     = memoryview(buf)
 		received = 0
 		while received < n:
-			chunk = sock.recv_into(view[received:], n - received)
+			try:
+				chunk = sock.recv_into(view[received:], n - received)
+			except TimeoutError:
+				# Periodic wake-up to notice stop(); keep waiting otherwise.
+				if not self._running:
+					raise
+				continue
 			if chunk == 0:
 				raise ConnectionError('connection closed')
 			received += chunk

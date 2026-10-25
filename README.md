@@ -175,6 +175,8 @@ The 16-byte `name` field optionally identifies an image:
 
 Multiple messages may be sent over a single connection sequentially. The server reads them until the connection is closed.
 
+Any number of clients may be connected at once: each connection is served by its own thread, and all incoming messages are funnelled through a single queue, so they are displayed in arrival order. Messages from one connection always keep their order. If the viewer falls behind, the queue (64 messages) fills and senders are slowed down by TCP back-pressure rather than frames being dropped.
+
 ### Sending from Python
 
 ```python
@@ -240,6 +242,37 @@ Sent 640x480x3 (921600 bytes) to 127.0.0.1:14972
 
 > **Note:** Watcher must already be running before you connect. If the connection is refused, start `watcher.py` first.
 
+### Sending from C++ (watcher_sender library)
+
+For use inside your own application, `watcher_sender.h` / `watcher_sender.cpp` provide a thread-safe, non-blocking sender. The header depends only on OpenCV core; all socket and threading code is confined to the `.cpp`, so no platform headers (e.g. `windows.h`) leak into your code.
+
+```cpp
+#include "watcher_sender.h"
+
+watcher::Sender::send(frame);                    // unnamed: display only
+watcher::Sender::send(frame(roi), "roi");        // named; ROIs / strided Mats are fine
+watcher::Sender::send(ptr, w, h, 3, stride, "raw"); // raw 8-bit pixels with row stride
+watcher::Sender::clear();                        // clear the viewer's history
+watcher::Sender::flush(1000);                    // optional: wait until the queue drains
+```
+
+Behaviour:
+
+- `send()` copies the image into a queue and returns immediately; a background thread transmits it over a single persistent connection to `127.0.0.1:14972`.
+- If watcher is not running, nothing blocks and nothing is reported: the background thread retries the connection once per second (500 ms connect timeout), and the queue keeps only the 16 most recent messages.
+- Only 8-bit images with 1, 3 or 4 channels are sent; anything else is silently ignored.
+- At program exit, pending images are drained for up to 1 s if connected.
+
+#### Using it from another CMake project
+
+See [INTEGRATION.md](INTEGRATION.md) for the CMake lines to add to your project.
+
+The `watcher_send_test` executable exercises the library:
+
+```bash
+./build/watcher_send_test path/to/image.png [more images...]
+```
+
 ---
 
 ## Programmatic use (Python)
@@ -291,7 +324,11 @@ widget.clear_peak_markers()
 watcher/
 ├── watcher.py          # PyQt6 application (viewer + TCP server)
 ├── img_send_test.cpp   # C++ image sender (test / integration)
-├── CMakeLists.txt      # Build script for img_send_test
+├── watcher_sender.h    # C++ sender library: public interface
+├── watcher_sender.cpp  # C++ sender library: sockets + background thread
+├── watcher_send_test.cpp # Test program for the sender library
+├── INTEGRATION.md      # Using the sender from another CMake project
+├── CMakeLists.txt      # Build script for the C++ tools
 └── requirements.txt    # Python dependencies
 ```
 
